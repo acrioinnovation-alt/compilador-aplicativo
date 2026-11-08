@@ -1,37 +1,523 @@
-name: Compilar Desafio Lógico
+name: MIA - Compilar APK Android
+run-name: MIA APK - ${{ inputs.project_id }}
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - 'entrada/**'
+    inputs:
+      project_id:
+        description: "Identificador do projeto enviado ao MIA"
+        required: true
+        type: string
+      source_token:
+        description: "Chave temporária de acesso ao ZIP deste projeto"
+        required: true
+        type: string
+      result_token:
+        description: "Chave temporária para transferir o APK ao armazenamento privado do MIA"
+        required: true
+        type: string
+      mia_base_url:
+        description: "URL HTTPS do serviço MIA no Render"
+        required: true
+        type: string
+      project_name:
+        description: "Nome do aplicativo a ser exibido no Android"
+        required: true
+        type: string
+      admob_test_mode:
+        description: "Usar IDs oficiais de demonstração do AdMob nesta compilação"
+        required: false
+        default: "false"
+        type: string
 
 permissions:
   contents: read
 
 jobs:
-  build:
-    name: Gerar APK Android
+  build-apk:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - name: Baixar repositório
+      - name: Baixar código do MIA
         uses: actions/checkout@v4
 
-      - name: Localizar ZIP do jogo
-        id: zip
+      - name: Preparar ambiente
         shell: bash
+        env:
+          PROJECT_ID: ${{ inputs.project_id }}
+          MIA_BASE_URL: ${{ inputs.mia_base_url }}
+          SOURCE_TOKEN: ${{ inputs.source_token }}
         run: |
-          ZIP_PATH="$(find entrada -maxdepth 1 -type f -iname '*.zip' 2>/dev/null | sort | head -n 1)"
-          if [ -z "$ZIP_PATH" ]; then
-            echo "::error::Nenhum ZIP encontrado em entrada/. Envie o ZIP do Desafio Lógico."
+          set -euo pipefail
+          if [[ ! "$MIA_BASE_URL" =~ ^https:// ]]; then
+            echo "::error::A URL do MIA precisa usar HTTPS."
             exit 1
           fi
-          echo "path=$ZIP_PATH" >> "$GITHUB_OUTPUT"
-          echo "Arquivo selecionado: $ZIP_PATH"
+          mkdir -p project
+          curl --fail --show-error --location --max-time 120 \
+            --header "Authorization: Bearer $SOURCE_TOKEN" \
+            "$MIA_BASE_URL/api/projects/$PROJECT_ID/download-source" \
+            --output /tmp/mia-project.zip
+          python - <<'PY'
+          import zipfile
+          from pathlib import Path
+          archive = Path("/tmp/mia-project.zip")
+          with zipfile.ZipFile(archive) as z:
+              root = Path("project").resolve()
+              for item in z.infolist():
+                  target = (root / item.filename).resolve()
+                  if target != root and root not in target.parents:
+                      raise SystemExit("ZIP contém caminho inseguro.")
+              z.extractall(root)
+          PY
 
-      - name: Preparar arquivos do jogo
-        run: python3 scripts/prepare_zip.py "${{ steps.zip.outputs.path }}"
+      - name: Adaptar projeto HTML para aplicativo Android
+        id: html_adapter
+        shell: bash
+        env:
+          PROJECT_ID: ${{ inputs.project_id }}
+          PROJECT_NAME: ${{ inputs.project_name }}
+          MIA_BASE_URL: ${{ inputs.mia_base_url }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PROJECT_NAME//[[:space:]]/}" ]; then
+            PROJECT_NAME="Aplicativo"
+          fi
+
+          # Se o ZIP já trouxer um projeto Gradle, mantenha o projeto original.
+          existing_gradle="$(find project -type f \( -name build.gradle -o -name build.gradle.kts -o -name settings.gradle -o -name settings.gradle.kts \) -print -quit)"
+          if [ -n "$existing_gradle" ] || [ -f "project/gradlew" ]; then
+            echo "Projeto Android/Gradle já existe; nenhuma adaptação HTML necessária."
+            exit 0
+          fi
+
+          # Priorize os arquivos web já organizados no pacote Android do usuário.
+          web_source="$(find project -type d -path '*/app/src/main/assets/www' -print -quit)"
+          if [ -z "$web_source" ]; then
+            html_file="$(find project -type f \( -name index.html -o -name '*.html' -o -name '*.htm' \) -not -path '*/node_modules/*' -print -quit)"
+            if [ -z "$html_file" ]; then
+              echo "::error::Não foi encontrado projeto Android/Gradle nem arquivos HTML para empacotar."
+              exit 1
+            fi
+            web_source="$(dirname "$html_file")"
+          fi
+
+          mkdir -p android-wrapper/app/src/main/assets/www
+          cp -a "$web_source"/. android-wrapper/app/src/main/assets/www/
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq librsvg2-bin
+          mkdir -p android-wrapper/app/src/main/res/mipmap-mdpi android-wrapper/app/src/main/res/mipmap-hdpi android-wrapper/app/src/main/res/mipmap-xhdpi android-wrapper/app/src/main/res/mipmap-xxhdpi android-wrapper/app/src/main/res/mipmap-xxxhdpi
+          icon_source="$(find android-wrapper/app/src/main/assets/www -type f -iname 'icon.svg' -print -quit)"
+          if [ -n "$icon_source" ]; then
+            rsvg-convert -w 48 -h 48 "$icon_source" -o android-wrapper/app/src/main/res/mipmap-mdpi/ic_launcher.png
+            rsvg-convert -w 72 -h 72 "$icon_source" -o android-wrapper/app/src/main/res/mipmap-hdpi/ic_launcher.png
+            rsvg-convert -w 96 -h 96 "$icon_source" -o android-wrapper/app/src/main/res/mipmap-xhdpi/ic_launcher.png
+            rsvg-convert -w 144 -h 144 "$icon_source" -o android-wrapper/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
+            rsvg-convert -w 192 -h 192 "$icon_source" -o android-wrapper/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+          else
+            echo "::warning::Não foi encontrado icon.svg; será criado um ícone padrão do MIA."
+            cat > /tmp/mia-default-icon.svg <<'SVG'
+          <svg xmlns="http://www.w3.org/2000/svg" width="192" height="192" viewBox="0 0 192 192">
+            <defs><linearGradient id="mia" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#2f78d0"/><stop offset="1" stop-color="#102e5b"/></linearGradient></defs><rect width="192" height="192" rx="42" fill="url(#mia)"/>
+            <path d="M29 132V58h18l49 54 49-54h18v74h-22V91l-45 49-45-49v41z" fill="#fff"/><circle cx="153" cy="143" r="13" fill="#70c5ff" stroke="#fff" stroke-width="5"/><path d="M145 143h16M153 135v16" stroke="#123b75" stroke-width="4" stroke-linecap="round"/>
+          </svg>
+          SVG
+            rsvg-convert -w 48 -h 48 /tmp/mia-default-icon.svg -o android-wrapper/app/src/main/res/mipmap-mdpi/ic_launcher.png
+            rsvg-convert -w 72 -h 72 /tmp/mia-default-icon.svg -o android-wrapper/app/src/main/res/mipmap-hdpi/ic_launcher.png
+            rsvg-convert -w 96 -h 96 /tmp/mia-default-icon.svg -o android-wrapper/app/src/main/res/mipmap-xhdpi/ic_launcher.png
+            rsvg-convert -w 144 -h 144 /tmp/mia-default-icon.svg -o android-wrapper/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
+            rsvg-convert -w 192 -h 192 /tmp/mia-default-icon.svg -o android-wrapper/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+          fi
+
+          if [ ! -f android-wrapper/app/src/main/assets/www/index.html ]; then
+            entry="$(find android-wrapper/app/src/main/assets/www -maxdepth 1 -type f \( -name '*.html' -o -name '*.htm' \) -print -quit)"
+            if [ -z "$entry" ]; then
+              echo "::error::A pasta web não contém um arquivo HTML de entrada."
+              exit 1
+            fi
+            cp "$entry" android-wrapper/app/src/main/assets/www/index.html
+          fi
+
+          mkdir -p android-wrapper/app/src/main/java/com/acrioinnovation/mia
+          cat > android-wrapper/settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "MIAWebApp"
+          include(":app")
+          EOF
+
+          cat > android-wrapper/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          EOF
+
+          cat > android-wrapper/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          EOF
+
+          cat > android-wrapper/app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          def admobAppId = (project.findProperty('admobAppId') ?: '').toString()
+          def rewardedAdUnitId = (project.findProperty('rewardedAdUnitId') ?: '').toString()
+          def interstitialAdUnitId = (project.findProperty('interstitialAdUnitId') ?: '').toString()
+
+          android {
+              namespace 'com.acrioinnovation.mia'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId "com.acrioinnovation.apps.p${project.findProperty('projectId') ?: 'default'}"
+                  minSdk 24
+                  targetSdk 28
+                  versionCode 1
+                  versionName '1.0'
+                  manifestPlaceholders = [APP_LABEL: (project.findProperty('appLabel') ?: 'Aplicativo').toString()]
+                  buildConfigField "String", "ADMOB_APP_ID", "\"${admobAppId}\""
+                  buildConfigField "String", "ADMOB_REWARDED_AD_UNIT_ID", "\"${rewardedAdUnitId}\""
+                  buildConfigField "String", "ADMOB_INTERSTITIAL_AD_UNIT_ID", "\"${interstitialAdUnitId}\""
+              }
+              buildFeatures {
+                  buildConfig true
+              }
+          }
+
+          dependencies {
+              // Google Mobile Ads Next-Gen SDK. IDs are supplied later through GitHub Actions secrets.
+              implementation 'com.google.android.libraries.ads.mobile.sdk:ads-mobile-sdk:1.6.0'
+          }
+          EOF
+
+          cat > android-wrapper/app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:allowBackup="false"
+                  android:label="${APP_LABEL}"
+                  android:icon="@mipmap/ic_launcher"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar"
+                  android:usesCleartextTraffic="false">
+                  <activity
+                      android:name="com.acrioinnovation.mia.MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > android-wrapper/app/src/main/java/com/acrioinnovation/mia/MainActivity.java <<'EOF'
+          package com.acrioinnovation.mia;
+
+          import android.app.Activity;
+          import android.app.DownloadManager;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.webkit.DownloadListener;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.webkit.WebSettings;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebChromeClient.FileChooserParams;
+          import android.widget.Toast;
+
+          import com.google.android.libraries.ads.mobile.sdk.MobileAds;
+          import com.google.android.libraries.ads.mobile.sdk.initialization.InitializationConfig;
+          import com.google.android.libraries.ads.mobile.sdk.common.AdRequest;
+          import com.google.android.libraries.ads.mobile.sdk.common.PreloadConfiguration;
+          import com.google.android.libraries.ads.mobile.sdk.rewarded.RewardedAd;
+          import com.google.android.libraries.ads.mobile.sdk.rewarded.RewardedAdPreloader;
+          import com.google.android.libraries.ads.mobile.sdk.interstitial.InterstitialAd;
+          import com.google.android.libraries.ads.mobile.sdk.interstitial.InterstitialAdPreloader;
+
+          public class MainActivity extends Activity {
+              private static final int FILE_CHOOSER_REQUEST = 7301;
+              private ValueCallback<Uri[]> filePathCallback;
+              private WebView webView;
+              private volatile boolean adsInitialized = false;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  webView = new WebView(this);
+                  WebSettings settings = webView.getSettings();
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+                  settings.setAllowFileAccess(true);
+                  settings.setAllowContentAccess(true);
+                  webView.addJavascriptInterface(new AndroidAdsBridge(), "AndroidAds");
+                  webView.setWebViewClient(new WebViewClient());
+                  webView.setDownloadListener(new DownloadListener() {
+                      @Override
+                      public void onDownloadStart(String url, String userAgent, String contentDisposition,
+                                                  String mimeType, long contentLength) {
+                          try {
+                              Uri uri = Uri.parse(url);
+                              DownloadManager.Request request = new DownloadManager.Request(uri);
+                              String fileName = android.webkit.URLUtil.guessFileName(url, contentDisposition, mimeType);
+                              request.setTitle(fileName);
+                              request.setDescription("Baixando arquivo pelo MIA");
+                              request.setMimeType(mimeType != null ? mimeType : "application/vnd.android.package-archive");
+                              request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                              request.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName);
+                              DownloadManager manager = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+                              if (manager == null) throw new IllegalStateException("Gerenciador de downloads indisponível");
+                              manager.enqueue(request);
+                              Toast.makeText(MainActivity.this, "Download iniciado. Verifique as notificações.", Toast.LENGTH_LONG).show();
+                          } catch (Exception e) {
+                              Toast.makeText(MainActivity.this, "Não foi possível iniciar o download. Abra o MIA no navegador e tente novamente.", Toast.LENGTH_LONG).show();
+                          }
+                      }
+                  });
+                  webView.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public boolean onShowFileChooser(
+                              WebView view,
+                              ValueCallback<Uri[]> callback,
+                              FileChooserParams fileChooserParams) {
+                          if (MainActivity.this.filePathCallback != null) {
+                              MainActivity.this.filePathCallback.onReceiveValue(null);
+                          }
+                          MainActivity.this.filePathCallback = callback;
+                          try {
+                              Intent intent = fileChooserParams.createIntent();
+                              startActivityForResult(
+                                  Intent.createChooser(intent, "Selecionar arquivo ZIP"),
+                                  FILE_CHOOSER_REQUEST
+                              );
+                              return true;
+                          } catch (Exception e) {
+                              MainActivity.this.filePathCallback = null;
+                              return false;
+                          }
+                      }
+                  });
+                  setContentView(webView);
+                  webView.loadUrl("file:///android_asset/www/index.html");
+                  initializeAdsIfConfigured();
+              }
+
+              private void initializeAdsIfConfigured() {
+                  final String appId = BuildConfig.ADMOB_APP_ID;
+                  if (appId == null || appId.trim().isEmpty()) return;
+                  new Thread(() -> {
+                      MobileAds.initialize(
+                          getApplicationContext(),
+                          new InitializationConfig.Builder(appId).build(),
+                          initializationStatus -> runOnUiThread(() -> {
+                              adsInitialized = true;
+                              String rewardedId = BuildConfig.ADMOB_REWARDED_AD_UNIT_ID;
+                              String interstitialId = BuildConfig.ADMOB_INTERSTITIAL_AD_UNIT_ID;
+                              if (rewardedId != null && !rewardedId.trim().isEmpty()) {
+                                  AdRequest request = new AdRequest.Builder(rewardedId).build();
+                                  RewardedAdPreloader.start(rewardedId, new PreloadConfiguration(request));
+                              }
+                              if (interstitialId != null && !interstitialId.trim().isEmpty()) {
+                                  AdRequest request = new AdRequest.Builder(interstitialId).build();
+                                  InterstitialAdPreloader.start(interstitialId, new PreloadConfiguration(request));
+                              }
+                          })
+                      );
+                  }).start();
+              }
+
+              public class AndroidAdsBridge {
+                  @JavascriptInterface
+                  public boolean isReady() {
+                      String id = BuildConfig.ADMOB_REWARDED_AD_UNIT_ID;
+                      return adsInitialized && id != null && !id.trim().isEmpty()
+                          && RewardedAdPreloader.isAdAvailable(id);
+                  }
+
+                  @JavascriptInterface
+                  public void showRewarded(String rewardType) {
+                      runOnUiThread(() -> {
+                          String id = BuildConfig.ADMOB_REWARDED_AD_UNIT_ID;
+                          if (!adsInitialized || id == null || id.trim().isEmpty()) {
+                              notifyWeb("unavailable", rewardType, 0);
+                              return;
+                          }
+                          RewardedAd ad = RewardedAdPreloader.pollAd(id);
+                          if (ad == null) {
+                              notifyWeb("unavailable", rewardType, 0);
+                              return;
+                          }
+                          ad.show(MainActivity.this, rewardItem -> {
+                              int amount = rewardItem.getAmount();
+                              notifyWeb("reward-earned", rewardType, amount);
+                          });
+                      });
+                  }
+
+                  @JavascriptInterface
+                  public boolean isInterstitialReady() {
+                      String id = BuildConfig.ADMOB_INTERSTITIAL_AD_UNIT_ID;
+                      return adsInitialized && id != null && !id.trim().isEmpty()
+                          && InterstitialAdPreloader.isAdAvailable(id);
+                  }
+
+                  @JavascriptInterface
+                  public void showInterstitial() {
+                      runOnUiThread(() -> {
+                          String id = BuildConfig.ADMOB_INTERSTITIAL_AD_UNIT_ID;
+                          if (!adsInitialized || id == null || id.trim().isEmpty()) return;
+                          InterstitialAd ad = InterstitialAdPreloader.pollAd(id);
+                          if (ad != null) ad.show(MainActivity.this);
+                      });
+                  }
+              }
+
+              private void notifyWeb(String eventName, String rewardType, int amount) {
+                  if (webView == null) return;
+                  String safeType = org.json.JSONObject.quote(rewardType == null ? "" : rewardType);
+                  String script = "window.dispatchEvent(new CustomEvent('mia-ad-" + eventName
+                      + "',{detail:{type:" + safeType + ",amount:" + amount + "}}));"
+                      + "if('" + eventName + "'==='reward-earned' && typeof window.onAndroidAdReward==='function')"
+                      + "window.onAndroidAdReward(" + safeType + "," + amount + ");";
+                  webView.evaluateJavascript(script, null);
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  super.onActivityResult(requestCode, resultCode, data);
+                  if (requestCode == FILE_CHOOSER_REQUEST) {
+                      if (filePathCallback == null) return;
+                      Uri[] results = null;
+                      if (resultCode == Activity.RESULT_OK && data != null) {
+                          Uri uri = data.getData();
+                          if (uri != null) results = new Uri[] { uri };
+                      }
+                      filePathCallback.onReceiveValue(results);
+                      filePathCallback = null;
+                  }
+              }
+          }
+          EOF
+
+          # O próprio MIA precisa abrir o serviço remoto: sua API roda no Render,
+          # não dentro do APK. Outros projetos web continuam abrindo os assets locais.
+          if find project -type f -path '*/app/main.py' -print -quit | grep -q . &&
+             find project -type f -path '*/web/index.html' -print -quit | grep -q .; then
+            python - <<'PY'
+          import os
+          from pathlib import Path
+          source = Path("android-wrapper/app/src/main/java/com/acrioinnovation/mia/MainActivity.java")
+          text = source.read_text(encoding="utf-8")
+          base_url = os.environ["MIA_BASE_URL"].rstrip("/")
+          if not base_url.startswith("https://"):
+              raise SystemExit("A URL pública do MIA precisa usar HTTPS.")
+          old = 'webView.loadUrl("file:///android_asset/www/index.html");'
+          new = 'webView.loadUrl("' + base_url + '");'
+          if old not in text:
+              raise SystemExit("Não encontrei a linha de abertura do WebView para corrigir.")
+          source.write_text(text.replace(old, new, 1), encoding="utf-8")
+          print("Detectado o código-fonte do MIA: o APK abrirá a interface hospedada no Render.")
+          PY
+          fi
+
+          echo "dir=android-wrapper" >> "$GITHUB_OUTPUT"
+
+      - name: Localizar raiz real do projeto Gradle
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d "android-wrapper" ]; then
+            echo "dir=android-wrapper" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python - <<'PY'
+          from pathlib import Path
+          root = Path("project")
+          ignored = {".gradle", ".git", "build", "node_modules"}
+          def allowed(path):
+              return not any(part in ignored for part in path.parts)
+          candidates = []
+          for name in ("settings.gradle.kts", "settings.gradle"):
+              candidates.extend(p for p in root.rglob(name) if allowed(p.relative_to(root)))
+          if candidates:
+              candidates.sort(key=lambda p: (len(p.relative_to(root).parts), str(p)))
+              project_root = candidates[0].parent
+          else:
+              wrappers = [p for p in root.rglob("gradlew") if allowed(p.relative_to(root))]
+              if wrappers:
+                  wrappers.sort(key=lambda p: (len(p.relative_to(root).parts), str(p)))
+                  project_root = wrappers[0].parent
+              elif (root / "build.gradle.kts").exists() or (root / "build.gradle").exists():
+                  project_root = root
+              else:
+                  raise SystemExit("Não foi encontrado settings.gradle(.kts), gradlew ou build.gradle na raiz do projeto.")
+          app_gradle = any((project_root / "app" / name).is_file() for name in ("build.gradle", "build.gradle.kts"))
+          manifest = project_root / "app" / "src" / "main" / "AndroidManifest.xml"
+          if app_gradle and manifest.is_file():
+              print(f"Projeto Android completo identificado: {project_root}")
+          else:
+              print(f"Raiz Gradle identificada: {project_root}")
+          with open(Path.cwd() / "__mia_project_root", "w", encoding="utf-8") as f:
+              f.write(project_root.as_posix())
+          PY
+          project_root="$(cat __mia_project_root)"
+          rm __mia_project_root
+          echo "dir=$project_root" >> "$GITHUB_OUTPUT"
+
+      - name: Corrigir nome exibido do aplicativo
+        if: steps.locate.outputs.dir != 'android-wrapper'
+        shell: bash
+        env:
+          PROJECT_NAME: ${{ inputs.project_name }}
+          PROJECT_DIR: ${{ steps.locate.outputs.dir }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          root = Path(os.environ["PROJECT_DIR"]).resolve()
+          label = os.environ.get("PROJECT_NAME", "").strip() or "Aplicativo"
+          android_ns = "{http://schemas.android.com/apk/res/android}"
+          manifests = list(root.glob("**/src/main/AndroidManifest.xml"))
+          if not manifests:
+              print("Nenhum AndroidManifest.xml em src/main; mantendo as configurações originais.")
+              raise SystemExit(0)
+          for manifest in manifests:
+              try:
+                  tree = ET.parse(manifest)
+                  app = tree.getroot().find("application")
+                  if app is None:
+                      continue
+                  app.set(android_ns + "label", label)
+                  ET.register_namespace("android", "http://schemas.android.com/apk/res/android")
+                  tree.write(manifest, encoding="utf-8", xml_declaration=True)
+                  print(f"Nome do aplicativo definido em {manifest}: {label}")
+              except ET.ParseError as exc:
+                  raise SystemExit(f"Manifesto Android inválido em {manifest}: {exc}")
+          PY
 
       - name: Configurar Java
         uses: actions/setup-java@v4
@@ -39,28 +525,98 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Preparar Android SDK
-        run: |
-          yes | sdkmanager --licenses >/dev/null
-          sdkmanager "platforms;android-35" "build-tools;35.0.0"
-
       - name: Configurar Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.9'
+          gradle-version: '8.8'
+
+      - name: Preparar permissão do Gradle
+        shell: bash
+        run: |
+          if [ -f "${{ steps.locate.outputs.dir }}/gradlew" ]; then
+            chmod +x "${{ steps.locate.outputs.dir }}/gradlew"
+          fi
 
       - name: Compilar APK
-        run: gradle --no-daemon assembleDebug
-
-      - name: Organizar APK
+        shell: bash
+        env:
+          PROJECT_ID: ${{ inputs.project_id }}
+          PROJECT_NAME: ${{ inputs.project_name }}
+          ADMOB_APP_ID: ${{ secrets.ADMOB_APP_ID }}
+          ADMOB_REWARDED_AD_UNIT_ID: ${{ secrets.ADMOB_REWARDED_AD_UNIT_ID }}
+          ADMOB_INTERSTITIAL_AD_UNIT_ID: ${{ secrets.ADMOB_INTERSTITIAL_AD_UNIT_ID }}
+          ADMOB_TEST_MODE: ${{ inputs.admob_test_mode }}
         run: |
-          mkdir -p saida
-          cp app/build/outputs/apk/debug/app-debug.apk saida/Desafio-Logico.apk
+          set -euo pipefail
+          if [ "$ADMOB_TEST_MODE" = "true" ]; then
+            echo "Usando somente IDs oficiais de demonstração do Google AdMob."
+            ADMOB_APP_ID="ca-app-pub-3940256099942544~3347511713"
+            ADMOB_REWARDED_AD_UNIT_ID="ca-app-pub-3940256099942544/5224354917"
+            ADMOB_INTERSTITIAL_AD_UNIT_ID="ca-app-pub-3940256099942544/1033173712"
+          fi
+          cd "${{ steps.locate.outputs.dir }}"
+          if [ -n "$ADMOB_APP_ID" ] && [[ ! "$ADMOB_APP_ID" =~ ^ca-app-pub-[0-9]+~[0-9]+$ ]]; then
+            echo "::error::O ID do aplicativo AdMob parece inválido. Confira o formato ca-app-pub-...~..."
+            exit 1
+          fi
+          if [ "${{ steps.locate.outputs.dir }}" = "android-wrapper" ] && [ -n "$ADMOB_APP_ID" ]; then
+            export ADMOB_APP_ID
+            python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          ET.register_namespace("android", "http://schemas.android.com/apk/res/android")
+          manifest = Path("app/src/main/AndroidManifest.xml")
+          if manifest.exists():
+              android_ns = "{http://schemas.android.com/apk/res/android}"
+              root = ET.parse(manifest).getroot()
+              application = root.find("application")
+              if application is None:
+                  raise SystemExit("AndroidManifest.xml não contém a tag <application>.")
+              has_app_id = any(
+                  child.tag == "meta-data"
+                  and child.get(android_ns + "name") == "com.google.android.gms.ads.APPLICATION_ID"
+                  for child in application
+              )
+              if not has_app_id:
+                  metadata = ET.Element("meta-data")
+                  metadata.set(android_ns + "name", "com.google.android.gms.ads.APPLICATION_ID")
+                  metadata.set(android_ns + "value", os.environ["ADMOB_APP_ID"])
+                  application.insert(0, metadata)
+              ET.indent(root, space="    ")
+              manifest.write_text(ET.tostring(root, encoding="unicode", xml_declaration=True), encoding="utf-8")
+              ET.parse(manifest)
+          PY
+          fi
+          if [ -f "./gradlew" ]; then
+            ./gradlew --no-daemon assembleDebug -PprojectId="$PROJECT_ID" -PappLabel="$PROJECT_NAME" -PadmobAppId="$ADMOB_APP_ID" -PrewardedAdUnitId="$ADMOB_REWARDED_AD_UNIT_ID" -PinterstitialAdUnitId="$ADMOB_INTERSTITIAL_AD_UNIT_ID"
+          else
+            gradle --no-daemon assembleDebug -PprojectId="$PROJECT_ID" -PappLabel="$PROJECT_NAME" -PadmobAppId="$ADMOB_APP_ID" -PrewardedAdUnitId="$ADMOB_REWARDED_AD_UNIT_ID" -PinterstitialAdUnitId="$ADMOB_INTERSTITIAL_AD_UNIT_ID"
+          fi
 
-      - name: Disponibilizar APK para download
-        uses: actions/upload-artifact@v4
-        with:
-          name: Desafio-Logico-APK
-          path: saida/Desafio-Logico.apk
-          if-no-files-found: error
-          retention-days: 7
+      - name: Transferir APK ao armazenamento privado do MIA
+        shell: bash
+        env:
+          PROJECT_ID: ${{ inputs.project_id }}
+          MIA_BASE_URL: ${{ inputs.mia_base_url }}
+          RESULT_TOKEN: ${{ inputs.result_token }}
+        run: |
+          set -euo pipefail
+          apk_path="$(find project -type f -path '*/build/outputs/apk/*/*.apk' -print -quit)"
+          if [ -z "$apk_path" ] && [ -d android-wrapper ]; then
+            apk_path="$(find android-wrapper -type f -path '*/build/outputs/apk/*/*.apk' -print -quit)"
+          fi
+          if [ -z "$apk_path" ]; then
+            echo "::error::Nenhum APK foi encontrado para transferência."
+            exit 1
+          fi
+          curl --fail --show-error --location --max-time 180 \
+            --header "Authorization: Bearer $RESULT_TOKEN" \
+            --form "file=@$apk_path;type=application/vnd.android.package-archive" \
+            "$MIA_BASE_URL/api/projects/$PROJECT_ID/upload-apk"
+
+      - name: Apagar arquivos temporários do runner
+        if: always()
+        shell: bash
+        run: |
+          rm -rf project android-wrapper /tmp/mia-project.zip __mia_project_root
