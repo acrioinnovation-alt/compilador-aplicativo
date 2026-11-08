@@ -1,1 +1,2 @@
-Coloque nesta pasta o ZIP do Desafio Lógico. O envio do ZIP para a branch main inicia a compilação automaticamente. Este repositório é público: não envie projetos privados.
+ATENÇÃO: NÃO envie ZIPs para esta pasta.
+Os projetos são recebidos pelo MIA e transferidos temporariamente ao runner por conexão HTTPS autenticada.
