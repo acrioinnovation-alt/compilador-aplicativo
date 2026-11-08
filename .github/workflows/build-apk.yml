@@ -1,0 +1,61 @@
+name: Compilar Desafio Lógico
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'entrada/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Gerar APK Android
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar repositório
+        uses: actions/checkout@v4
+
+      - name: Localizar ZIP do jogo
+        id: zip
+        shell: bash
+        run: |
+          ZIP_PATH="$(find entrada -maxdepth 1 -type f -iname '*.zip' 2>/dev/null | sort | head -n 1)"
+          if [ -z "$ZIP_PATH" ]; then
+            echo "::error::Nenhum ZIP encontrado em entrada/. Envie o ZIP do Desafio Lógico."
+            exit 1
+          fi
+          echo "path=$ZIP_PATH" >> "$GITHUB_OUTPUT"
+          echo "Arquivo selecionado: $ZIP_PATH"
+
+      - name: Preparar arquivos do jogo
+        run: python3 scripts/prepare_zip.py "${{ steps.zip.outputs.path }}"
+
+      - name: Configurar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Configurar Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Compilar APK
+        run: gradle --no-daemon assembleRelease
+
+      - name: Organizar APK
+        run: |
+          mkdir -p saida
+          cp app/build/outputs/apk/release/app-release-unsigned.apk saida/Desafio-Logico.apk
+
+      - name: Disponibilizar APK para download
+        uses: actions/upload-artifact@v4
+        with:
+          name: Desafio-Logico-APK
+          path: saida/Desafio-Logico.apk
+          if-no-files-found: error
+          retention-days: 7
